@@ -1,0 +1,423 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["markitdown[all]", "markitdown-ocr", "openai"]
+# ///
+"""mdx - convert files and URLs to Markdown with MarkItDown.
+
+Optional image description / OCR through EVREN or a local MLX server.
+"""
+import argparse
+import atexit
+import json
+import os
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+
+VERSION = "0.2.0"
+CONFIG_PATH = (
+    Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "mdx" / "config.json"
+)
+
+BACKENDS = {
+    "evren": {
+        "flag": "-e",
+        "base_url_env": "EVREN_BASE_URL",
+        "base_url_default": "https://evren-llmapi.ssyz.org.tr/v1",
+        "api_key_env": "EVRENAPI",
+        "api_key_default": "",
+        "model_env": "EVREN_VISION_MODEL",
+        "model_default": "gemma-4-31b",
+    },
+    "mlx": {
+        "flag": "-l",
+        "base_url_env": "MLX_BASE_URL",
+        "base_url_default": "http://127.0.0.1:8080/v1",
+        "api_key_env": "MLX_API_KEY",
+        "api_key_default": "mlx",
+        "model_env": "MLX_MODEL",
+        "model_default": "",
+    },
+}
+
+HELP = """\
+mdx - convert files and URLs to Markdown (MarkItDown wrapper)
+
+Usage:
+  mdx INPUT... [-o OUT] [-l | -e] [options]
+  mdx status                         show versions, backends, models, server state
+  mdx changedefaultmodel [BACKEND]   pick the default model interactively
+  mdx help                           show this help
+
+Options:
+  -o, --output PATH   output file (single input) or directory
+  -l, --local         describe images / OCR with the local MLX server
+                      (starts it if down, stops it afterwards if mdx started it)
+  -e, --evren         describe images / OCR with the EVREN API
+  --llm BACKEND       none (default), evren or mlx
+  --model NAME        model for this run only
+  --base-url URL      backend base URL for this run only
+  --prompt TEXT       custom image description prompt
+  --ocr               OCR embedded images in pdf/docx/pptx/xlsx (needs -l or -e)
+  --keep              leave the MLX server running if mdx started it
+  -V, --version       show version
+  -h, --help          show this help
+
+Examples:
+  mdx report.pdf -o report.md
+  mdx slides.pptx -l -o slides.md
+  mdx scan.pdf -l --ocr -o scan.md
+  mdx *.docx -e -o ./md_out/
+  mdx https://example.com/article
+
+Settings are resolved in this order: flag > environment > config file > default.
+  Environment: EVRENAPI (key), EVREN_BASE_URL, EVREN_VISION_MODEL,
+               MLX_BASE_URL, MLX_MODEL, MLX_START, MLX_API_KEY
+  Config file: %s
+
+A file named 'status' or 'help' must be given as ./status or ./help.
+""" % CONFIG_PATH
+
+
+# ------------------------------------------------------------------ config
+
+def load_config():
+    try:
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_config(cfg):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+
+
+def resolve(backend, field, flag=None):
+    """Return (value, source). Order: flag > env > config file > built-in default."""
+    spec = BACKENDS[backend]
+    if flag:
+        return flag, "flag"
+    env_name = spec[f"{field}_env"]
+    if os.environ.get(env_name):
+        return os.environ[env_name], f"env {env_name}"
+    if field == "model":
+        saved = load_config().get(f"{backend}_model")
+        if saved:
+            return saved, "config"
+    return spec[f"{field}_default"], "default"
+
+
+def resolve_mlx_start():
+    if os.environ.get("MLX_START"):
+        return os.environ["MLX_START"], "env MLX_START"
+    saved = load_config().get("mlx_start")
+    if saved:
+        return saved, "config"
+    return "gemma", "default"
+
+
+# ------------------------------------------------------------------ servers
+
+def ssl_context():
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
+def request_models(backend, timeout=5):
+    base_url, _ = resolve(backend, "base_url")
+    api_key, _ = resolve(backend, "api_key")
+    req = urllib.request.Request(base_url.rstrip("/") + "/models")
+    if api_key:
+        req.add_header("Authorization", f"Bearer {api_key}")
+    return urllib.request.urlopen(req, timeout=timeout, context=ssl_context())
+
+
+def server_up(backend):
+    try:
+        with request_models(backend, timeout=3):
+            return True
+    except Exception:
+        return False
+
+
+def list_models(backend):
+    try:
+        with request_models(backend, timeout=10) as resp:
+            data = json.load(resp)
+        return sorted(item["id"] for item in data.get("data", []))
+    except Exception:
+        return []
+
+
+def probe(backend):
+    try:
+        with request_models(backend) as resp:
+            return f"reachable (HTTP {resp.status})"
+    except urllib.error.HTTPError as exc:
+        return f"HTTP {exc.code}"
+    except Exception as exc:
+        return f"unreachable ({getattr(exc, 'reason', exc)})"
+
+
+def running_mlx_model():
+    """Model reported by the mlx-status helper, or None."""
+    try:
+        out = subprocess.run(
+            ["mlx-status"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    for line in out.splitlines():
+        if line.startswith("RUNNING:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def stop_mlx():
+    print("mdx: stopping MLX server (started by mdx)", file=sys.stderr)
+    subprocess.run(
+        ["mlx-stop"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
+    )
+
+
+def ensure_mlx(model, keep=False, wait=180):
+    if server_up("mlx"):
+        running = running_mlx_model()
+        if running and running != model:
+            print(
+                f"mdx: note: server runs '{running}' but mdx requests '{model}'",
+                file=sys.stderr,
+            )
+        return
+    profile, _ = resolve_mlx_start()
+    print(f"mdx: MLX server is down, starting '{profile}' ...", file=sys.stderr)
+    try:
+        subprocess.Popen(
+            ["mlx-start", profile],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        sys.exit("mdx: 'mlx-start' not found in PATH")
+    if not keep:
+        atexit.register(stop_mlx)
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if server_up("mlx"):
+            return
+        time.sleep(2)
+    sys.exit("mdx: MLX server did not come up, see ~/llm-local/server.log")
+
+
+# ------------------------------------------------------------------ commands
+
+def cmd_status():
+    def row(label, value, source=None):
+        suffix = f"   [{source}]" if source else ""
+        print(f"  {label:<10}{value}{suffix}")
+
+    print(f"mdx {VERSION}")
+    state = "exists" if CONFIG_PATH.exists() else "not created yet"
+    print(f"config: {CONFIG_PATH} ({state})")
+    parts = []
+    for pkg in ("markitdown", "markitdown-ocr", "openai"):
+        try:
+            parts.append(f"{pkg} {version(pkg)}")
+        except PackageNotFoundError:
+            parts.append(f"{pkg} (not installed)")
+    print(" | ".join(parts))
+
+    for backend, spec in BACKENDS.items():
+        base_url, base_src = resolve(backend, "base_url")
+        model, model_src = resolve(backend, "model")
+        api_key, key_src = resolve(backend, "api_key")
+        print(f"\n{backend} ({spec['flag']})")
+        row("base url", base_url, base_src)
+        row("model", model or "(not set - run: mdx changedefaultmodel)", model_src)
+        row("api key", "set" if api_key else "missing", key_src if api_key else None)
+        if backend == "mlx":
+            profile, profile_src = resolve_mlx_start()
+            row("start", f"mlx-start {profile}", profile_src)
+            if server_up("mlx"):
+                running = running_mlx_model()
+                row("server", f"up, running: {running}" if running else "up")
+                if running and model and running != model:
+                    row("", "note: running model differs from the default model")
+            else:
+                row("server", "down (mdx -l starts it when needed)")
+        else:
+            row("endpoint", probe("evren"))
+    return 0
+
+
+def cmd_changedefaultmodel(argv):
+    backend = argv[0].lower() if argv else None
+    if backend not in BACKENDS:
+        print("Backends: 1) evren   2) mlx")
+        choice = input("Backend [mlx]: ").strip().lower() or "mlx"
+        backend = {"1": "evren", "2": "mlx"}.get(choice, choice)
+        if backend not in BACKENDS:
+            sys.exit(f"mdx: unknown backend '{choice}'")
+
+    current, source = resolve(backend, "model")
+    models = list_models(backend)
+    print(f"\nCurrent {backend} model: {current or '(none)'}  [{source}]")
+    if models:
+        for index, name in enumerate(models, 1):
+            mark = "  <- current" if name == current else ""
+            print(f"  {index:>2}) {name}{mark}")
+    else:
+        print("Could not list models (server down or no access). Enter a name manually.")
+
+    answer = input("Number or model name (Enter keeps current): ").strip()
+    if not answer:
+        print("Unchanged.")
+        return 0
+    if answer.isdigit():
+        if not (models and 1 <= int(answer) <= len(models)):
+            sys.exit("mdx: invalid number")
+        model = models[int(answer) - 1]
+    else:
+        model = answer
+
+    cfg = load_config()
+    cfg[f"{backend}_model"] = model
+    if backend == "mlx":
+        lowered = model.lower()
+        guess = next(
+            (name for name in ("gemma", "qwen", "paddle") if name in lowered),
+            cfg.get("mlx_start", "gemma"),
+        )
+        cfg["mlx_start"] = input(f"mlx-start profile for auto-start [{guess}]: ").strip() or guess
+    save_config(cfg)
+    print(f"Saved to {CONFIG_PATH}")
+
+    env_name = BACKENDS[backend]["model_env"]
+    if os.environ.get(env_name):
+        print(f"Warning: ${env_name} is set in your environment and overrides this setting.")
+    return 0
+
+
+# ------------------------------------------------------------------ convert
+
+def build_converter(args):
+    from markitdown import MarkItDown
+
+    kwargs = {"enable_plugins": args.ocr}
+    if args.llm != "none":
+        from openai import OpenAI
+
+        base_url, _ = resolve(args.llm, "base_url", args.base_url)
+        api_key, _ = resolve(args.llm, "api_key")
+        model, _ = resolve(args.llm, "model", args.model)
+        problems = []
+        if not base_url:
+            problems.append("base URL")
+        if not model:
+            problems.append("model (run: mdx changedefaultmodel)")
+        if args.llm == "evren" and not api_key:
+            problems.append("API key (set EVRENAPI)")
+        if problems:
+            sys.exit(f"mdx: missing {', '.join(problems)} for backend '{args.llm}'")
+        if args.llm == "mlx":
+            ensure_mlx(model, keep=args.keep)
+        kwargs["llm_client"] = OpenAI(base_url=base_url, api_key=api_key, max_retries=3)
+        kwargs["llm_model"] = model
+        if args.prompt:
+            kwargs["llm_prompt"] = args.prompt
+    elif args.ocr:
+        print("mdx: --ocr needs -l or -e, OCR will be skipped", file=sys.stderr)
+    return MarkItDown(**kwargs)
+
+
+def parse_convert_args(argv):
+    parser = argparse.ArgumentParser(prog="mdx", add_help=False)
+    parser.add_argument("inputs", nargs="*")
+    parser.add_argument("-o", "--output")
+    parser.add_argument("--llm", choices=["none", "evren", "mlx"], default="none")
+    parser.add_argument("-l", "--local", action="store_true")
+    parser.add_argument("-e", "--evren", action="store_true")
+    parser.add_argument("--model")
+    parser.add_argument("--base-url")
+    parser.add_argument("--prompt")
+    parser.add_argument("--ocr", action="store_true")
+    parser.add_argument("--keep", action="store_true")
+    parser.add_argument("-V", "--version", action="store_true")
+    parser.add_argument("-h", "--help", action="store_true")
+    return parser.parse_args(argv)
+
+
+def run_convert(argv):
+    args = parse_convert_args(argv)
+    if args.help:
+        print(HELP)
+        return 0
+    if args.version:
+        print(f"mdx {VERSION}")
+        return 0
+    if not args.inputs:
+        print(HELP, file=sys.stderr)
+        return 2
+    if args.local and args.evren:
+        sys.exit("mdx: use either -l or -e, not both")
+    if args.local:
+        args.llm = "mlx"
+    elif args.evren:
+        args.llm = "evren"
+
+    converter = build_converter(args)
+    out = Path(args.output) if args.output else None
+    as_dir = out is not None and (len(args.inputs) > 1 or out.is_dir())
+    if as_dir:
+        out.mkdir(parents=True, exist_ok=True)
+
+    failed = False
+    for source in args.inputs:
+        try:
+            text = converter.convert(source).markdown
+        except Exception as exc:
+            print(f"mdx: {source}: {exc}", file=sys.stderr)
+            failed = True
+            continue
+        if out is None:
+            if len(args.inputs) > 1:
+                print(f"\n<!-- {source} -->\n")
+            print(text)
+        else:
+            target = out / (Path(source).stem + ".md") if as_dir else out
+            target.write_text(text, encoding="utf-8")
+            print(f"mdx: {source} -> {target}", file=sys.stderr)
+    return 1 if failed else 0
+
+
+def main():
+    argv = sys.argv[1:]
+    command = argv[0] if argv else "help"
+    try:
+        if command in ("help", "-h", "--help"):
+            print(HELP)
+            return 0
+        if command == "status":
+            return cmd_status()
+        if command == "changedefaultmodel":
+            return cmd_changedefaultmodel(argv[1:])
+        return run_convert(argv)
+    except (KeyboardInterrupt, EOFError):
+        print(file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
