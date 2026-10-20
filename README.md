@@ -13,8 +13,8 @@ through a local MLX server or the EVREN LLM API (any OpenAI-compatible endpoint)
 ## Requirements
 
 - [uv](https://docs.astral.sh/uv/) (dependencies are resolved automatically on first run)
-- For `-l`: a local MLX server on port 8080 and helper commands `mlx-start`, `mlx-stop`,
-  `mlx-status` in your PATH (only needed for auto start/stop)
+- For `-l`: a local MLX server on port 8080 and the `mlx` command (`mlx start`, `mlx stop`,
+  `mlx status`) in your PATH (only needed for auto start/stop)
 - For `-e`: an EVREN API key in the `EVRENAPI` environment variable
 
 ## Install
@@ -49,7 +49,7 @@ Resolved in this order: command-line flag, environment variable, config file
 | EVREN_VISION_MODEL | EVREN model for image description         |
 | MLX_BASE_URL       | local server URL (default 127.0.0.1:8080) |
 | MLX_MODEL          | local model id                            |
-| MLX_START          | profile passed to `mlx-start`             |
+| MLX_START          | profile passed to `mlx start`             |
 
 ## Privacy
 

@@ -171,10 +171,10 @@ def probe(backend):
 
 
 def running_mlx_model():
-    """Model reported by the mlx-status helper, or None."""
+    """Model reported by `mlx status`, or None."""
     try:
         out = subprocess.run(
-            ["mlx-status"], capture_output=True, text=True, timeout=10
+            ["mlx", "status"], capture_output=True, text=True, timeout=10
         ).stdout
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return None
@@ -187,7 +187,7 @@ def running_mlx_model():
 def stop_mlx():
     print("mdx: stopping MLX server (started by mdx)", file=sys.stderr)
     subprocess.run(
-        ["mlx-stop"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
+        ["mlx", "stop"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
     )
 
 
@@ -204,13 +204,13 @@ def ensure_mlx(model, keep=False, wait=180):
     print(f"mdx: MLX server is down, starting '{profile}' ...", file=sys.stderr)
     try:
         subprocess.Popen(
-            ["mlx-start", profile],
+            ["mlx", "start", profile],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
     except FileNotFoundError:
-        sys.exit("mdx: 'mlx-start' not found in PATH")
+        sys.exit("mdx: 'mlx' not found in PATH")
     if not keep:
         atexit.register(stop_mlx)
     deadline = time.time() + wait
@@ -249,7 +249,7 @@ def cmd_status():
         row("api key", "set" if api_key else "missing", key_src if api_key else None)
         if backend == "mlx":
             profile, profile_src = resolve_mlx_start()
-            row("start", f"mlx-start {profile}", profile_src)
+            row("start", f"mlx start {profile}", profile_src)
             if server_up("mlx"):
                 running = running_mlx_model()
                 row("server", f"up, running: {running}" if running else "up")
@@ -300,7 +300,7 @@ def cmd_changedefaultmodel(argv):
             (name for name in ("gemma", "qwen", "paddle") if name in lowered),
             cfg.get("mlx_start", "gemma"),
         )
-        cfg["mlx_start"] = input(f"mlx-start profile for auto-start [{guess}]: ").strip() or guess
+        cfg["mlx_start"] = input(f"mlx start profile for auto-start [{guess}]: ").strip() or guess
     save_config(cfg)
     print(f"Saved to {CONFIG_PATH}")
 
